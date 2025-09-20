@@ -1,0 +1,1323 @@
+#!/usr/bin/env python3
+"""
+Indo Setup Compression (PySide6)
+
+Extra features:
+1. More professional UI with tab layout
+2. Input for bundle name and version
+3. Easy package search
+4. Display information of the selected package
+5. Preview README before build
+6. Status bar with useful information
+7. Better input validation
+8. Consistent theme
+"""
+
+import os
+import re
+import sys
+import tarfile
+import tempfile
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Dict, List, Set, Optional, Tuple
+from datetime import datetime
+import json
+import webbrowser
+
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QSize, QStringListModel, QSortFilterProxyModel, QItemSelectionModel
+from PySide6.QtWidgets import (
+    QApplication,
+    QWidget,
+    QListWidget,
+    QListWidgetItem,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QFileDialog,
+    QTextEdit,
+    QProgressBar,
+    QMessageBox,
+    QCheckBox,
+    QLabel,
+    QTabWidget,
+    QLineEdit,
+    QGroupBox,
+    QSplitter,
+    QStatusBar,
+    QToolBar,
+    QToolButton,
+    QStyle,
+    QSizePolicy,
+    QFrame,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QComboBox,
+    QMainWindow,
+    QProgressDialog,
+    QListView,
+)
+from PySide6.QtGui import QIcon, QFont, QPalette, QColor
+
+STATUS_PATH = "/var/lib/dpkg/xdeb-status"
+
+
+def parse_status(path: str) -> Dict[str, Dict[str, str]]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read()
+    entries = content.strip().split("\n\n")
+    pkgs: Dict[str, Dict[str, str]] = {}
+    for entry in entries:
+        lines = entry.splitlines()
+        if not lines:
+            continue
+        cur_field = None
+        data = {}
+        for line in lines:
+            if line.startswith(" ") or line.startswith("\t"):
+                if cur_field:
+                    data[cur_field] += "\n" + line.strip()
+                continue
+            if ": " in line:
+                k, v = line.split(": ", 1)
+                cur_field = k
+                data[k] = v
+        pkgname = data.get("Package")
+        if pkgname:
+            pkgs[pkgname] = data
+    return pkgs
+
+
+def parse_depends_field(depends: str) -> List[List[str]]:
+    if not depends:
+        return []
+    groups: List[List[str]] = []
+    parts = [p.strip() for p in depends.split(",") if p.strip()]
+    for part in parts:
+        alts = [a.strip() for a in part.split("|")]
+        alts_clean = [re.sub(r"\s*\(.*\)", "", a).strip() for a in alts]
+        groups.append(alts_clean)
+    return groups
+
+
+def resolve_dependencies(pkg: str, pkgs_db: Dict[str, Dict[str, str]], visited: Optional[Set[str]] = None) -> Set[str]:
+    if visited is None:
+        visited = set()
+    if pkg in visited:
+        return visited
+    visited.add(pkg)
+
+    depends_str = ""
+    entry = pkgs_db.get(pkg)
+
+    if entry:
+        depends_str = entry.get("Depends", "")
+    else:
+        try:
+            cmd = ["apt-cache", "depends", pkg]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            depends_lines = []
+            for line in result.stdout.splitlines():
+                if "Depends:" in line:
+                    dep_pkg = line.split(":", 1)[1].strip()
+                    if not dep_pkg.startswith('<'):
+                        depends_lines.append(dep_pkg)
+            depends_str = ", ".join(depends_lines)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            depends_str = ""
+
+    if not depends_str:
+        return visited
+
+    groups = parse_depends_field(depends_str)
+    for group in groups:
+        for alt in group:
+            resolve_dependencies(alt, pkgs_db, visited)
+            break
+    return visited
+
+
+def get_package_details_from_apt(pkg_name: str) -> Dict[str, str]:
+    """Fetches and parses package details using 'apt-cache show'."""
+    try:
+        cmd = ["apt-cache", "show", pkg_name]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=True, encoding="utf-8", errors="ignore"
+        )
+
+        data = {}
+        cur_field = None
+        for line in result.stdout.splitlines():
+            if not line:
+                continue
+            if line.startswith(" ") or line.startswith("\t"):
+                if cur_field:
+                    data[cur_field] += "\n" + line.strip()
+                continue
+            if ": " in line:
+                k, v = line.split(": ", 1)
+                cur_field = k
+                data[k] = v
+        return data
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return {}
+
+
+def get_deb_package_info(deb_path: str) -> Dict[str, str]:
+    """Extract package information from a .deb file using dpkg-deb."""
+    try:
+        cmd = ["dpkg-deb", "-f", deb_path]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=True, encoding="utf-8", errors="ignore"
+        )
+
+        data = {}
+        for line in result.stdout.splitlines():
+            if ": " in line:
+                k, v = line.split(": ", 1)
+                data[k] = v
+        return data
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return {}
+
+
+class DownloaderThread(QThread):
+    log = Signal(str)
+    progress = Signal(int)
+    finished = Signal(bool, str)
+
+    def __init__(self, packages: List[str], pkgs_db: Dict[str, Dict[str, str]], out_dir: str,
+                 readme_text: str, bundle_name: str, bundle_version: str, compression_type: str = "gz",
+                 logo_path: str = None, banner_path: str = None):
+        super().__init__()
+        self.packages = packages
+        self.pkgs_db = pkgs_db
+        self.out_dir = out_dir
+        self.readme_text = readme_text
+        self.bundle_name = bundle_name
+        self.bundle_version = bundle_version
+        self.compression_type = compression_type
+        self.manual_debs: List[str] = []
+        self.logo_path = logo_path
+        self.banner_path = banner_path
+
+    def run(self):
+        try:
+            workdir = Path(tempfile.mkdtemp(prefix="xdeb_"))
+            debs_dir = workdir / "DEBS"
+            debs_dir.mkdir(parents=True, exist_ok=True)
+            readmes_dir = workdir / "readmes"
+            readmes_dir.mkdir(parents=True, exist_ok=True)
+
+            self.log.emit(f"Working directory: {workdir}\n")
+
+            if self.manual_debs:
+                for deb_path in self.manual_debs:
+                    try:
+                        if os.path.isfile(deb_path):
+                            shutil.copy(deb_path, debs_dir)
+                            self.log.emit(f"Added manual deb: {deb_path}\n")
+                    except Exception as e:
+                        self.log.emit(f"Failed to add manual deb {deb_path}: {e}\n")
+
+            if self.logo_path and os.path.isfile(self.logo_path):
+                logo_dest = workdir / "logo.png"
+                shutil.copy(self.logo_path, logo_dest)
+                self.log.emit(f"Added logo: {self.logo_path}\n")
+
+            if self.banner_path and os.path.isfile(self.banner_path):
+                banner_dest = workdir / "banner.png"
+                shutil.copy(self.banner_path, banner_dest)
+                self.log.emit(f"Added banner: {self.banner_path}\n")
+
+            all_pkgs: Set[str] = set()
+            self.log.emit("Resolving dependencies for selected packages...\n")
+            for p in self.packages:
+                deps = resolve_dependencies(p, self.pkgs_db)
+                all_pkgs.update(deps)
+            all_pkgs.update(self.packages)
+
+            # Handle dependencies for manual .deb files
+            for deb_path in self.manual_debs:
+                deb_info = get_deb_package_info(deb_path)
+                pkg_name = deb_info.get("Package", "")
+                if pkg_name:
+                    deps = resolve_dependencies(pkg_name, self.pkgs_db)
+                    all_pkgs.update(deps)
+                    all_pkgs.add(pkg_name)
+
+            self.log.emit("Filtering out already installed packages...\n")
+            final_pkgs_to_bundle: Set[str] = set()
+            for p in sorted(list(all_pkgs)):
+                entry = self.pkgs_db.get(p)
+                if entry:
+                    status = entry.get("Status", "")
+                    if "installed" not in status:
+                        final_pkgs_to_bundle.add(p)
+                    else:
+                        self.log.emit(f"Skipping installed package: {p}\n")
+                else:
+                    final_pkgs_to_bundle.add(p)
+
+            if not final_pkgs_to_bundle and not self.manual_debs:
+                self.log.emit("All selected packages and their dependencies are already installed. Nothing to bundle.\n")
+                self.finished.emit(True, "All selected packages are already installed.")
+                return
+
+            pkg_versions: Dict[str, str] = {}
+            for p in sorted(final_pkgs_to_bundle):
+                entry = self.pkgs_db.get(p)
+                if entry and "Version" in entry:
+                    ver = entry.get("Version", "")
+                    pkg_versions[p] = ver
+                else:
+                    pkg_versions[p] = ""
+
+            total = len(pkg_versions)
+            self.log.emit(f"Total packages to download: {total}\n")
+
+            idx = 0
+            for p, ver in pkg_versions.items():
+                idx += 1
+                self.progress.emit(int((idx / max(total,1)) * 100))
+                try:
+                    if ver:
+                        cmd = ["apt-get", "download", f"{p}={ver}"]
+                    else:
+                        cmd = ["apt-get", "download", p]
+                    r = subprocess.run(cmd, cwd=str(debs_dir), capture_output=True, text=True)
+                    if r.returncode != 0:
+                        self.log.emit(f"Failed to download {p}: {r.stderr}\n")
+                    else:
+                        self.log.emit(f"Downloaded: {p}\n")
+                except Exception as e:
+                    self.log.emit(f"Error downloading {p}: {e}\n")
+
+            readme = readmes_dir / "README_en-US"
+            with open(readme, "w", encoding="utf-8") as f:
+                f.write(self.readme_text.strip() + "\n")
+            self.log.emit("README file created\n")
+
+            metadata_file = workdir / "metadata"
+            with open(metadata_file, "w", encoding="utf-8") as f:
+                f.write(f"Bundle-Name: {self.bundle_name}\n")
+                f.write(f"Bundle-Version: {self.bundle_version}\n")
+                f.write(f"Creation-Date: {datetime.now().isoformat()}\n")
+                f.write(f"Package-Count: {len(final_pkgs_to_bundle) + len(self.manual_debs)}\n")
+                f.write(f"Packages: {', '.join(sorted(final_pkgs_to_bundle))}\n")
+                if self.manual_debs:
+                    f.write(f"Manual-DEBs: {', '.join([os.path.basename(x) for x in self.manual_debs])}\n")
+            self.log.emit("Metadata file created\n")
+
+            filename = f"{self.bundle_name}_{self.bundle_version}.xdeb"
+            out_path = Path(self.out_dir) / filename
+            if self.compression_type == "gz":
+                tar_mode = "w:gz"
+            elif self.compression_type == "bz2":
+                tar_mode = "w:bz2"
+            elif self.compression_type == "xz":
+                tar_mode = "w:xz"
+            elif self.compression_type == "lzma":
+                tar_mode = "w:xz"
+            elif self.compression_type == "zstd":
+                try:
+                    tar_mode = "w:zst"
+                except Exception:
+                    tar_mode = "w"
+            else:
+                tar_mode = "w:gz"
+
+            with tarfile.open(out_path, tar_mode) as tar:
+                logo_file = workdir / "logo.png"
+                if logo_file.exists():
+                    tar.add(logo_file, arcname="logo.png")
+                banner_file = workdir / "banner.png"
+                if banner_file.exists():
+                    tar.add(banner_file, arcname="banner.png")
+                for item in [debs_dir, readmes_dir, metadata_file]:
+                    if item.is_file():
+                        arcname = str(item.relative_to(workdir))
+                        tar.add(item, arcname=arcname)
+                    else:
+                        for root, _, files in os.walk(item):
+                            for name in files:
+                                path = Path(root) / name
+                                arcname = str(path.relative_to(workdir))
+                                tar.add(path, arcname=arcname)
+
+            self.log.emit(f"XDEB bundle created: {out_path}\n")
+            shutil.rmtree(workdir, ignore_errors=True)
+            self.progress.emit(100)
+            self.finished.emit(True, str(out_path))
+        except Exception as e:
+            self.log.emit(f"Error: {str(e)}\n")
+            self.finished.emit(False, str(e))
+
+
+class PackageInfoWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setProperty("class", "PackageInfoWidget")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        # Header: Title kiri, tombol kanan
+        header = QWidget()
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(4)
+        self.title_label = QLabel("Package Information")
+        self.title_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+        header_layout.addWidget(self.title_label, alignment=Qt.AlignLeft)
+        self.use_as_bundle_btn = QPushButton("Use as Bundle Info")
+        self.use_as_bundle_btn.setToolTip("Copy package name and version to bundle info")
+        self.use_as_bundle_btn.setEnabled(False)
+        self.use_as_bundle_btn.setFixedHeight(22)
+        self.use_as_bundle_btn.setStyleSheet("font-size: 10px; padding: 2px 8px;")
+        header_layout.addStretch()
+        header_layout.addWidget(self.use_as_bundle_btn, alignment=Qt.AlignRight)
+        layout.addWidget(header)
+
+        # Info group
+        info_group = QGroupBox("Details")
+        info_group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 11px; margin-top: 4px; }")
+        info_layout = QVBoxLayout(info_group)
+        info_layout.setContentsMargins(6, 6, 6, 6)
+        info_layout.setSpacing(3)
+
+        self.name_label = QLabel("Name: ")
+        self.version_label = QLabel("Version: ")
+        self.description_label = QLabel("Description: ")
+        self.depends_label = QLabel("Dependencies: ")
+
+        for label in [self.name_label, self.version_label, self.description_label, self.depends_label]:
+            label.setWordWrap(True)
+            label.setStyleSheet("padding: 1px; font-size: 10px;")
+            info_layout.addWidget(label)
+
+        info_layout.addStretch()
+        layout.addWidget(info_group)
+        layout.setStretchFactor(info_group, 1)
+
+        self._last_pkg_data = {}
+
+    def update_info(self, pkg_data: Dict[str, str]):
+        self.name_label.setText(f"<b>Name:</b> {pkg_data.get('Package', 'N/A')}")
+        self.version_label.setText(f"<b>Version:</b> {pkg_data.get('Version', 'N/A')}")
+        desc = pkg_data.get('Description', 'No description available')
+        self.description_label.setText(f"<b>Description:</b> {desc}")
+        depends = pkg_data.get('Depends', 'None')
+        self.depends_label.setText(f"<b>Dependencies:</b> {depends}")
+        self._last_pkg_data = pkg_data
+        if pkg_data.get('Package') and pkg_data.get('Version'):
+            self.use_as_bundle_btn.setEnabled(True)
+        else:
+            self.use_as_bundle_btn.setEnabled(False)
+
+    def clear_info(self):
+        self.update_info({})
+
+    def get_last_pkg_name_version(self):
+        return self._last_pkg_data.get('Package', ''), self._last_pkg_data.get('Version', '')
+
+
+class BundleInfoDialog(QDialog):
+    def __init__(self, parent=None, name="", version=""):
+        super().__init__(parent)
+        self.setProperty("class", "BundleInfoDialog")
+        self.setWindowTitle("Bundle Information")
+        self.resize(400, 200)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(15)
+
+        form_layout = QFormLayout()
+        form_layout.setSpacing(10)
+
+        self.name_edit = QLineEdit(name)
+        self.name_edit.setPlaceholderText("Enter bundle name")
+        form_layout.addRow("Bundle Name:", self.name_edit)
+
+        self.version_edit = QLineEdit(version)
+        self.version_edit.setPlaceholderText("Enter bundle version")
+        form_layout.addRow("Bundle Version:", self.version_edit)
+
+        layout.addLayout(form_layout)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def get_bundle_info(self):
+        return self.name_edit.text().strip(), self.version_edit.text().strip()
+
+
+class IndoSetupMainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setProperty("class", "IndoSetupMainWindow")
+        self.setWindowTitle("Indo Setup Compression")
+        self.resize(900, 600)  # compact
+        self.pkgs_db = {}
+        self.output_dir = str(Path.home())
+        self.selected_count = 0
+        self.bundle_name = "mybundle"
+        self.bundle_version = "1.0.0"
+        self.total_packages_available = 0
+        self.manual_debs: List[str] = []
+        self.selected_repo_pkgs: List[str] = []
+        self.selected_manual_debs: List[str] = []
+        self.status_path = STATUS_PATH
+        self.compression_type = "gz"
+        # --- Move UI setup before load_packages ---
+        if not self._check_dependencies():
+            sys.exit(1)
+        self.setup_ui()
+        self.load_packages()
+        self.update_status()
+
+    def _check_dependencies(self) -> bool:
+        if not shutil.which("apt-cache"):
+            QMessageBox.critical(self, "Dependency Missing",
+                                 "The 'apt-cache' command was not found.\n"
+                                 "This application requires 'apt-cache' (Debian/Ubuntu/Mint system).")
+            return False
+        return True
+
+    def themed_icon(self, name, fallback=None):
+        icon = QIcon.fromTheme(name)
+        if not icon.isNull():
+            return icon
+        if fallback and os.path.exists(fallback):
+            return QIcon(fallback)
+        return QIcon()
+
+    def setup_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setSpacing(4)
+        main_layout.setContentsMargins(4, 4, 4, 4)
+
+        self.setup_toolbar()
+
+        # Baris kedua: info bundle (name, version), loading
+        bundle_info_widget = QWidget()
+        bundle_info_layout = QHBoxLayout(bundle_info_widget)
+        bundle_info_layout.setContentsMargins(0, 0, 0, 0)
+        bundle_info_layout.setSpacing(4)
+        bundle_info_layout.addWidget(QLabel("Bundle:"))
+        self.bundle_name_label = QLabel("mybundle")
+        self.bundle_name_label.setStyleSheet("font-size: 11px;")
+        bundle_info_layout.addWidget(self.bundle_name_label)
+        bundle_info_layout.addWidget(QLabel("Version:"))
+        self.bundle_version_label = QLabel("1.0.0")
+        self.bundle_version_label.setStyleSheet("font-size: 11px;")
+        bundle_info_layout.addWidget(self.bundle_version_label)
+        self.loading_label = QLabel("Loading packages, please wait...", self)
+        font = self.loading_label.font()
+        font.setPointSize(10)
+        self.loading_label.setFont(font)
+        self.loading_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.loading_label.setVisible(False)
+        bundle_info_layout.addWidget(self.loading_label)
+        bundle_info_layout.addStretch()
+        main_layout.addWidget(bundle_info_widget)
+
+        content_splitter = QSplitter(Qt.Horizontal)
+        main_layout.addWidget(content_splitter, 1)
+
+        # Panel kiri: search, add package, daftar package
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 2, 0)
+        left_layout.setSpacing(2)
+
+        # Search + Add Package
+        search_row = QWidget()
+        search_row_layout = QHBoxLayout(search_row)
+        search_row_layout.setContentsMargins(0, 0, 0, 0)
+        search_row_layout.setSpacing(2)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search packages...")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.setMinimumHeight(22)
+        self.search_edit.setMaximumHeight(26)
+        self.search_edit.setStyleSheet("font-size: 11px;")
+        self.search_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.search_edit.textChanged.connect(self.filter_packages)
+        search_row_layout.addWidget(self.search_edit, stretch=1)
+        self.add_package_btn = QPushButton("Add")
+        self.add_package_btn.setToolTip("Tambahkan package terpilih ke bundle")
+        self.add_package_btn.setMinimumHeight(22)
+        self.add_package_btn.setMaximumHeight(26)
+        self.add_package_btn.setStyleSheet("font-size: 11px;")
+        self.add_package_btn.clicked.connect(self.add_selected_packages_to_bundle)
+        search_row_layout.addWidget(self.add_package_btn)
+        left_layout.addWidget(search_row)
+
+        # Daftar package
+        list_group = QGroupBox("Available Packages")
+        # Perbaiki agar label judul groupbox tidak terpotong bawahnya
+        list_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 0px solid #cccccc;
+                border-radius: 3px;
+                margin-top: 12px; /* lebih besar agar judul tidak terpotong */
+                padding-top: 8px;
+                padding-bottom: 2px;
+                padding-left: 4px;
+                padding-right: 4px;
+                font-size: 11px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 4px;
+                top: 2px; /* naikkan sedikit judul */
+                padding: 0 4px 0 4px;
+                font-size: 11px;
+                background: transparent;
+            }
+        """)
+        list_layout = QVBoxLayout(list_group)
+        list_layout.setContentsMargins(4, 4, 4, 4)
+        list_layout.setSpacing(2)
+        self.pkg_model = QStringListModel()
+        self.pkg_proxy_model = QSortFilterProxyModel()
+        self.pkg_proxy_model.setSourceModel(self.pkg_model)
+        self.pkg_view = QListView()
+        self.pkg_view.setModel(self.pkg_proxy_model)
+        self.pkg_view.setSelectionMode(QListView.ExtendedSelection)
+        self.pkg_view.setMinimumHeight(200)
+        self.pkg_view.setStyleSheet("font-size: 11px;")
+        self.pkg_view.selectionModel().selectionChanged.connect(self.update_selection_count)
+        self.pkg_view.selectionModel().selectionChanged.connect(self.on_pkg_selection_changed)
+        list_layout.addWidget(self.pkg_view)
+        left_layout.addWidget(list_group, stretch=1)
+
+        list_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        self.selected_label = QLabel("0 packages selected")
+        self.selected_label.setStyleSheet("font-weight: bold; margin-top: 2px; margin-bottom: 1px; font-size: 11px;")
+        left_layout.addWidget(self.selected_label, alignment=Qt.AlignRight)
+
+        content_splitter.addWidget(left_panel)
+
+        # Panel kanan: tab
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(2, 0, 0, 0)
+        right_layout.setSpacing(2)
+
+        self.right_tabs = QTabWidget()
+        self.right_tabs.setDocumentMode(True)
+        self.right_tabs.setStyleSheet("font-size: 11px;")
+
+        readme_tab = QWidget()
+        readme_layout = QVBoxLayout(readme_tab)
+        readme_layout.setContentsMargins(4, 4, 4, 4)
+        readme_label = QLabel("README Content:")
+        readme_label.setStyleSheet("font-weight: bold; font-size: 11px;")
+        readme_layout.addWidget(readme_label)
+        self.readme_editor = QTextEdit()
+        self.readme_editor.setPlaceholderText("Write README content here...")
+        self.readme_editor.setStyleSheet("font-size: 11px;")
+        readme_layout.addWidget(self.readme_editor)
+        self.right_tabs.addTab(readme_tab, "README")
+
+        self.info_widget = PackageInfoWidget()
+        self.right_tabs.addTab(self.info_widget, "Package Info")
+        self.info_widget.use_as_bundle_btn.clicked.connect(self.use_package_info_as_bundle)
+
+        log_tab = QWidget()
+        log_layout = QVBoxLayout(log_tab)
+        log_layout.setContentsMargins(4, 4, 4, 4)
+        log_label = QLabel("Build Log:")
+        log_label.setStyleSheet("font-weight: bold; font-size: 11px;")
+        log_layout.addWidget(log_label)
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setStyleSheet("font-size: 11px;")
+        log_layout.addWidget(self.log)
+        self.right_tabs.addTab(log_tab, "Build Log")
+
+        # Selected Packages tab: ubah layout, hilangkan QTabWidget di dalamnya
+        selected_tab = QWidget()
+        selected_layout = QVBoxLayout(selected_tab)
+        selected_layout.setContentsMargins(4, 4, 4, 4)
+        selected_layout.setSpacing(4)
+
+        # Label "From Repository"
+        repo_label = QLabel("From Repository")
+        repo_label.setStyleSheet("font-weight: bold; font-size: 11px; margin-bottom: 2px;")
+        selected_layout.addWidget(repo_label)
+        self.selected_repo_list = QListWidget()
+        self.selected_repo_list.setSelectionMode(QListWidget.NoSelection)
+        self.selected_repo_list.setStyleSheet("font-size: 11px;")
+        selected_layout.addWidget(self.selected_repo_list)
+
+        # Spacer
+        selected_layout.addSpacing(6)
+
+        # Label "Added .deb Files"
+        manual_label = QLabel("Added .deb Files")
+        manual_label.setStyleSheet("font-weight: bold; font-size: 11px; margin-bottom: 2px;")
+        selected_layout.addWidget(manual_label)
+        self.selected_manual_list = QListWidget()
+        self.selected_manual_list.setSelectionMode(QListWidget.NoSelection)
+        self.selected_manual_list.setStyleSheet("font-size: 11px;")
+        selected_layout.addWidget(self.selected_manual_list)
+
+        self.right_tabs.addTab(selected_tab, "Selected Packages")
+
+        right_layout.addWidget(self.right_tabs)
+        content_splitter.addWidget(right_panel)
+
+        content_splitter.setSizes([220, 650])  # compact
+
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        self.progress.setMinimum(0)
+        self.progress.setMaximum(100)
+        self.progress.setValue(0)
+        self.progress.setFixedHeight(16)
+        main_layout.addWidget(self.progress)
+
+        self.status_bar = QStatusBar()
+        self.status_bar.setSizeGripEnabled(True)
+        self.setStatusBar(self.status_bar)
+        self.loading_label_status = QLabel("Loading packages, please wait...", self)
+        font = self.loading_label_status.font()
+        font.setPointSize(10)
+        self.loading_label_status.setFont(font)
+        self.loading_label_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.loading_label_status.setVisible(False)
+        self.status_bar.addPermanentWidget(self.loading_label_status)
+
+        self.apply_styles()
+
+    def setup_toolbar(self):
+        toolbar = QToolBar()
+        toolbar.setIconSize(QSize(24, 24))
+        toolbar.setMovable(False)
+        self.addToolBar(toolbar)
+
+        self.new_project_btn = QToolButton()
+        self.new_project_btn.setText("New Project")
+        self.new_project_btn.setIcon(self.themed_icon("document-new", "/usr/share/icons/hicolor/24x24/actions/document-new.png"))
+        self.new_project_btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.new_project_btn.clicked.connect(self.new_project)
+        toolbar.addWidget(self.new_project_btn)
+
+        self.open_project_btn = QToolButton()
+        self.open_project_btn.setText("Open Project")
+        self.open_project_btn.setIcon(self.themed_icon("document-open", "/usr/share/icons/hicolor/24x24/actions/document-open.png"))
+        self.open_project_btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.open_project_btn.clicked.connect(self.open_project)
+        toolbar.addWidget(self.open_project_btn)
+
+        self.save_project_btn = QToolButton()
+        self.save_project_btn.setText("Save Project")
+        self.save_project_btn.setIcon(self.themed_icon("document-save", "/usr/share/icons/hicolor/24x24/actions/document-save.png"))
+        self.save_project_btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.save_project_btn.clicked.connect(self.save_project)
+        toolbar.addWidget(self.save_project_btn)
+
+        self.refresh_btn = QToolButton()
+        self.refresh_btn.setText("Refresh")
+        self.refresh_btn.setIcon(self.themed_icon("view-refresh", "/usr/share/icons/hicolor/24x24/actions/view-refresh.png"))
+        self.refresh_btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.refresh_btn.clicked.connect(self.refresh_and_reload_packages)
+        toolbar.addWidget(self.refresh_btn)
+
+        self.statusfile_btn = QToolButton()
+        self.statusfile_btn.setText("Status File")
+        self.statusfile_btn.setIcon(self.themed_icon("dialog-information", "/usr/share/icons/hicolor/24x24/status/dialog-information.png"))
+        self.statusfile_btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.statusfile_btn.clicked.connect(self.choose_status_file)
+        toolbar.addWidget(self.statusfile_btn)
+
+        self.output_btn = QToolButton()
+        self.output_btn.setText("Output")
+        self.output_btn.setIcon(self.themed_icon("folder", "/usr/share/icons/hicolor/24x24/places/folder.png"))
+        self.output_btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.output_btn.clicked.connect(self.choose_output)
+        toolbar.addWidget(self.output_btn)
+
+        self.bundle_info_btn = QToolButton()
+        self.bundle_info_btn.setText("Bundle Info")
+        self.bundle_info_btn.setIcon(self.themed_icon("document-properties", "/usr/share/icons/hicolor/24x24/apps/document-properties.png"))
+        self.bundle_info_btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.bundle_info_btn.clicked.connect(self.edit_bundle_info)
+        toolbar.addWidget(self.bundle_info_btn)
+
+        self.add_deb_btn = QToolButton()
+        self.add_deb_btn.setText("Add .deb")
+        self.add_deb_btn.setIcon(self.themed_icon("list-add", "/usr/share/icons/hicolor/24x24/actions/list-add.png"))
+        self.add_deb_btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.add_deb_btn.clicked.connect(self.add_deb_files)
+        toolbar.addWidget(self.add_deb_btn)
+
+        self.logo_path = None
+        self.logo_btn = QToolButton()
+        self.logo_btn.setText("Set Logo")
+        self.logo_btn.setIcon(self.themed_icon("image-x-generic", None))
+        self.logo_btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.logo_btn.clicked.connect(self.choose_logo_file)
+        toolbar.addWidget(self.logo_btn)
+
+        self.banner_path = None
+        self.banner_btn = QToolButton()
+        self.banner_btn.setText("Set Banner")
+        self.banner_btn.setIcon(self.themed_icon("image-x-generic", None))
+        self.banner_btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.banner_btn.clicked.connect(self.choose_banner_file)
+        toolbar.addWidget(self.banner_btn)
+
+        self.preview_btn = QToolButton()
+        self.preview_btn.setText("Preview")
+        self.preview_btn.setIcon(self.themed_icon("document-preview", "/usr/share/icons/hicolor/24x24/apps/document-preview.png"))
+        self.preview_btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.preview_btn.clicked.connect(self.preview_readme)
+        toolbar.addWidget(self.preview_btn)
+
+        self.build_btn = QToolButton()
+        self.build_btn.setText("Build")
+        self.build_btn.setIcon(self.themed_icon("system-run", "/usr/share/icons/hicolor/24x24/actions/system-run.png"))
+        self.build_btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.build_btn.clicked.connect(self.build_xdeb)
+        toolbar.addWidget(self.build_btn)
+
+        self.help_btn = QToolButton()
+        self.help_btn.setText("Help")
+        self.help_btn.setIcon(self.themed_icon("help-browser", "/usr/share/icons/hicolor/24x24/apps/help-browser.png"))
+        self.help_btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.help_btn.clicked.connect(self.open_help_url)
+        toolbar.addWidget(self.help_btn)
+
+        toolbar.addSeparator()
+
+        compression_widget = QWidget()
+        compression_layout = QVBoxLayout(compression_widget)
+        compression_layout.setContentsMargins(0, 0, 0, 0)
+        compression_layout.setSpacing(2)
+        compression_label = QLabel("Compression:")
+        compression_label.setAlignment(Qt.AlignHCenter)
+        compression_layout.addWidget(compression_label)
+        self.compression_combo = QComboBox()
+        self.compression_combo.setMaximumWidth(120)
+        self.compression_combo.addItem(self.themed_icon("application-x-bzip-compressed-tar"), "bzip2 (.bz2)", "bz2")
+        self.compression_combo.addItem(self.themed_icon("application-x-compressed-tar"), "gzip (.gz)", "gz")
+        self.compression_combo.addItem(self.themed_icon("application-x-lzma-compressed-tar"), "lzma (.xz)", "lzma")
+        self.compression_combo.addItem(self.themed_icon("application-x-xz-compressed-tar"), "xz (.xz)", "xz")
+        self.compression_combo.addItem(self.themed_icon("application-zstd"), "zstd (.zst)", "zstd")
+        self.compression_combo.setCurrentIndex(1)
+        self.compression_combo.setToolTip("Select compression type for bundle")
+        self.compression_combo.currentIndexChanged.connect(self.on_compression_changed)
+        compression_layout.addWidget(self.compression_combo)
+        toolbar.addWidget(compression_widget)
+
+        toolbar.addSeparator()
+
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        toolbar.addWidget(spacer)
+
+    def choose_logo_file(self):
+        file, _ = QFileDialog.getOpenFileName(self, "Select logo.png", str(Path.home()), "PNG Images (*.png)")
+        if file:
+            self.logo_path = file
+            self.logo_btn.setIcon(QIcon(file))
+            self.status_bar.showMessage(f"Logo set: {file}")
+
+    def choose_banner_file(self):
+        file, _ = QFileDialog.getOpenFileName(self, "Select banner.png", str(Path.home()), "PNG Images (*.png)")
+        if file:
+            self.banner_path = file
+            self.banner_btn.setIcon(QIcon(file))
+            self.status_bar.showMessage(f"Banner set: {file}")
+
+    def on_compression_changed(self, idx):
+        self.compression_type = self.compression_combo.currentData()
+        self.update_status()
+
+    def update_status(self, message: str = ""):
+        if message:
+            self.status_bar.showMessage(message)
+        else:
+            comp_map = {"gz": "gzip", "bz2": "bzip2", "xz": "xz", "lzma": "lzma", "zstd": "zstd"}
+            comp_str = comp_map.get(self.compression_type, self.compression_type)
+            self.status_bar.showMessage(
+                f"Available: {self.total_packages_available} | Selected: {self.selected_count} | Output: {self.output_dir} | Status: {self.status_path} | Compression: {comp_str}"
+            )
+
+    @Slot()
+    def load_packages(self):
+        class PackageLoaderThread(QThread):
+            finished = Signal(dict, list)
+            error = Signal(str)
+            def __init__(self, status_path):
+                super().__init__()
+                self.status_path = status_path
+            def run(self):
+                try:
+                    pkgs_db = {}
+                    try:
+                        pkgs_db = parse_status(self.status_path)
+                    except Exception:
+                        pass
+                    cmd = ["apt-cache", "pkgnames"]
+                    result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding="utf-8", errors="ignore")
+                    pkg_names = [p.strip() for p in result.stdout.splitlines() if p.strip()]
+                    self.finished.emit(pkgs_db, pkg_names)
+                except Exception as e:
+                    self.error.emit(str(e))
+        self.loading_label.setVisible(True)
+        self.loading_label_status.setVisible(True)
+        self.thread = PackageLoaderThread(self.status_path)
+        self.thread.finished.connect(self.on_packages_loaded)
+        self.thread.error.connect(self.on_packages_load_error)
+        self.thread.start()
+
+    @Slot(dict, list)
+    def on_packages_loaded(self, pkgs_db: Dict[str, Dict[str, str]], pkg_names: List[str]):
+        self.pkgs_db = pkgs_db
+        self.pkg_model.setStringList(sorted(pkg_names))
+        self.total_packages_available = len(pkg_names)
+        self.loading_label.setVisible(False)
+        self.loading_label_status.setVisible(False)
+        self.update_status()
+
+    @Slot(str)
+    def on_packages_load_error(self, error: str):
+        self.loading_label.setVisible(False)
+        self.loading_label_status.setVisible(False)
+        QMessageBox.critical(self, "Error", f"Failed to load packages: {error}")
+
+    @Slot()
+    def refresh_and_reload_packages(self):
+        # Jalankan pkexec apt update di terminal, hanya sekali prompt password
+        import subprocess
+        import shutil
+
+        terminal = (
+            shutil.which("x-terminal-emulator")
+            or shutil.which("gnome-terminal")
+            or shutil.which("konsole")
+            or shutil.which("xfce4-terminal")
+            or shutil.which("xterm")
+        )
+        if not terminal:
+            QMessageBox.critical(self, "Error", "No terminal emulator found (x-terminal-emulator, gnome-terminal, konsole, xfce4-terminal, xterm).")
+            return
+
+        # Jangan jalankan pkexec dua kali, cukup sekali di terminal
+        shell_cmd = "pkexec sh -c 'apt update; echo; read -p \"Press ENTER to close...\"'"
+        try:
+            subprocess.run([terminal, "-e", shell_cmd])
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to run apt update in terminal: {e}")
+            return
+
+        # Setelah selesai, reset state dan reload packages
+        self.selected_repo_pkgs.clear()
+        self.manual_debs.clear()
+        self.selected_repo_list.clear()
+        self.selected_manual_list.clear()
+        self.selected_count = 0
+        self.update_selection_count()
+        self.update_status()
+        self.load_packages()
+
+    @Slot()
+    def choose_status_file(self):
+        file, _ = QFileDialog.getOpenFileName(self, "Select dpkg status file", "/var/lib/dpkg", "All Files (*)")
+        if file:
+            self.status_path = file
+            self.load_packages()
+
+    @Slot()
+    def choose_output(self):
+        dir = QFileDialog.getExistingDirectory(self, "Select Output Directory", self.output_dir)
+        if dir:
+            self.output_dir = dir
+            self.update_status()
+
+    @Slot()
+    def edit_bundle_info(self):
+        dialog = BundleInfoDialog(self, self.bundle_name, self.bundle_version)
+        if dialog.exec():
+            name, version = dialog.get_bundle_info()
+            if name:
+                self.bundle_name = name
+                self.bundle_name_label.setText(name)
+            if version:
+                self.bundle_version = version
+                self.bundle_version_label.setText(version)
+            self.update_status()
+
+    @Slot()
+    def add_deb_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Select .deb files", str(Path.home()), "Debian Packages (*.deb)")
+        if files:
+            for file in files:
+                if file not in self.manual_debs:
+                    self.manual_debs.append(file)
+                    item = QListWidgetItem(f"{os.path.basename(file)}")
+                    self.selected_manual_list.addItem(item)
+                    self.selected_count += 1
+            self.update_selection_count()
+            self.update_status()
+
+    @Slot()
+    def add_selected_packages_to_bundle(self):
+        selected_indexes = self.pkg_view.selectionModel().selectedIndexes()
+        if not selected_indexes:
+            QMessageBox.information(self, "No Selection", "Please select at least one package from the list.")
+            return
+        for index in selected_indexes:
+            pkg_name = index.data(Qt.DisplayRole)
+            if pkg_name and pkg_name not in self.selected_repo_pkgs:
+                self.selected_repo_pkgs.append(pkg_name)
+                item = QListWidgetItem(f"{pkg_name}")
+                self.selected_repo_list.addItem(item)
+                self.selected_count += 1
+        self.update_selection_count()
+        self.update_status()
+
+    @Slot()
+    def update_selection_count(self):
+        selected_indexes = self.pkg_view.selectionModel().selectedIndexes()
+        self.selected_label.setText(f"{len(selected_indexes)} packages selected (Total in bundle: {self.selected_count})")
+
+    @Slot()
+    def on_pkg_selection_changed(self):
+        selected_indexes = self.pkg_view.selectionModel().selectedIndexes()
+        if not selected_indexes:
+            self.info_widget.clear_info()
+            return
+        pkg_name = selected_indexes[0].data(Qt.DisplayRole)
+        if pkg_name:
+            pkg_data = self.pkgs_db.get(pkg_name, {})
+            if not pkg_data:
+                pkg_data = get_package_details_from_apt(pkg_name)
+            self.info_widget.update_info(pkg_data)
+
+    @Slot()
+    def use_package_info_as_bundle(self):
+        name, version = self.info_widget.get_last_pkg_name_version()
+        if name:
+            self.bundle_name = name
+            self.bundle_name_label.setText(name)
+        if version:
+            self.bundle_version = version
+            self.bundle_version_label.setText(version)
+        self.update_status()
+
+    @Slot()
+    def preview_readme(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("README Preview")
+        dialog.resize(600, 500)
+        layout = QVBoxLayout(dialog)
+        text_edit = QTextEdit()
+        text_edit.setPlainText(self.readme_editor.toPlainText())
+        text_edit.setReadOnly(True)
+        layout.addWidget(text_edit)
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok)
+        button_box.accepted.connect(dialog.accept)
+        layout.addWidget(button_box)
+        dialog.exec()
+
+    @Slot()
+    def build_xdeb(self):
+        if not self.selected_repo_pkgs and not self.manual_debs:
+            QMessageBox.warning(self, "No Packages", "Please add at least one package or .deb file to the bundle.")
+            return
+        if not self.bundle_name:
+            QMessageBox.warning(self, "No Bundle Name", "Please set a bundle name.")
+            return
+        if not self.bundle_version:
+            QMessageBox.warning(self, "No Bundle Version", "Please set a bundle version.")
+            return
+        if not self.readme_editor.toPlainText().strip():
+            reply = QMessageBox.question(self, "Empty README", "The README is empty. Continue without README?",
+                                         QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.No:
+                return
+
+        self.progress.setVisible(True)
+        self.log.clear()
+        self.thread = DownloaderThread(
+            self.selected_repo_pkgs,
+            self.pkgs_db,
+            self.output_dir,
+            self.readme_editor.toPlainText(),
+            self.bundle_name,
+            self.bundle_version,
+            self.compression_type,
+            self.logo_path,
+            self.banner_path
+        )
+        self.thread.manual_debs = self.manual_debs
+        self.thread.log.connect(self.log.append)
+        self.thread.progress.connect(self.progress.setValue)
+        self.thread.finished.connect(self.on_build_finished)
+        self.thread.start()
+
+    @Slot(bool, str)
+    def on_build_finished(self, success: bool, message: str):
+        self.progress.setVisible(False)
+        if success:
+            QMessageBox.information(self, "Success", f"XDEB bundle created: {message}")
+        else:
+            QMessageBox.critical(self, "Error", f"Failed to create bundle: {message}")
+
+    @Slot()
+    def filter_packages(self):
+        text = self.search_edit.text().strip()
+        if not text:
+            self.pkg_proxy_model.setFilterFixedString("")
+        else:
+            self.pkg_proxy_model.setFilterFixedString(text)
+
+    @Slot()
+    def new_project(self):
+        self.selected_repo_pkgs.clear()
+        self.selected_manual_debs.clear()
+        self.selected_repo_list.clear()
+        self.selected_manual_list.clear()
+        self.selected_count = 0
+        self.readme_editor.clear()
+        self.bundle_name = "mybundle"
+        self.bundle_version = "1.0.0"
+        self.bundle_name_label.setText(self.bundle_name)
+        self.bundle_version_label.setText(self.bundle_version)
+        self.logo_path = None
+        self.banner_path = None
+        self.logo_btn.setIcon(self.themed_icon("image-x-generic", None))
+        self.banner_btn.setIcon(self.themed_icon("image-x-generic", None))
+        self.update_selection_count()
+        self.update_status()
+
+    @Slot()
+    def save_project(self):
+        file, _ = QFileDialog.getSaveFileName(self, "Save Project", str(Path.home()), "Indo Setup Project (*.isp)")
+        if not file:
+            return
+        data = {
+            "bundle_name": self.bundle_name,
+            "bundle_version": self.bundle_version,
+            "readme": self.readme_editor.toPlainText(),
+            "repo_pkgs": self.selected_repo_pkgs,
+            "manual_debs": self.manual_debs,
+            "logo_path": self.logo_path,
+            "banner_path": self.banner_path,
+            "compression_type": self.compression_type,
+        }
+        try:
+            with open(file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            self.status_bar.showMessage(f"Project saved: {file}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save project: {e}")
+
+    @Slot()
+    def open_project(self):
+        file, _ = QFileDialog.getOpenFileName(self, "Open Project", str(Path.home()), "Indo Setup Project (*.isp)")
+        if not file:
+            return
+        try:
+            with open(file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.bundle_name = data.get("bundle_name", "mybundle")
+            self.bundle_version = data.get("bundle_version", "1.0.0")
+            self.bundle_name_label.setText(self.bundle_name)
+            self.bundle_version_label.setText(self.bundle_version)
+            self.readme_editor.setPlainText(data.get("readme", ""))
+            self.selected_repo_pkgs = data.get("repo_pkgs", [])
+            self.manual_debs = data.get("manual_debs", [])
+            self.logo_path = data.get("logo_path")
+            self.banner_path = data.get("banner_path")
+            self.compression_type = data.get("compression_type", "gz")
+            idx = self.compression_combo.findData(self.compression_type)
+            if idx >= 0:
+                self.compression_combo.setCurrentIndex(idx)
+            if self.logo_path and os.path.exists(self.logo_path):
+                self.logo_btn.setIcon(QIcon(self.logo_path))
+            if self.banner_path and os.path.exists(self.banner_path):
+                self.banner_btn.setIcon(QIcon(self.banner_path))
+            self.selected_repo_list.clear()
+            for pkg in self.selected_repo_pkgs:
+                self.selected_repo_list.addItem(pkg)
+            self.selected_manual_list.clear()
+            for deb in self.manual_debs:
+                self.selected_manual_list.addItem(os.path.basename(deb))
+            self.selected_count = len(self.selected_repo_pkgs) + len(self.manual_debs)
+            self.update_selection_count()
+            self.update_status()
+            self.status_bar.showMessage(f"Project loaded: {file}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load project: {e}")
+
+    def apply_styles(self):
+        self.setStyleSheet("""
+            QMainWindow, QDialog {
+                background-color: #f0f0f0;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #cccccc;
+                border-radius: 3px;
+                margin-top: 4px;
+                padding-top: 4px;
+                padding-bottom: 2px;
+                padding-left: 4px;
+                padding-right: 4px;
+                font-size: 11px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 4px;
+                padding: 0 2px 0 2px;
+                font-size: 11px;
+            }
+            QListView, QListWidget, QTextEdit, QLineEdit {
+                border: 1px solid #cccccc;
+                border-radius: 2px;
+                padding: 2px;
+                background-color: white;
+                selection-background-color: #3daee9;
+                selection-color: white;
+                font-size: 11px;
+            }
+            QListView::item:hover, QListWidget::item:hover {
+                background-color: #e0e0e0;
+            }
+            QPushButton, QToolButton {
+                background-color: #e0e0e0;
+                border: 1px solid #cccccc;
+                border-radius: 3px;
+                padding: 2px 6px;
+                min-width: 40px;
+                font-size: 11px;
+            }
+            QPushButton:hover, QToolButton:hover {
+                background-color: #d0d0d0;
+            }
+            QPushButton:pressed, QToolButton:pressed {
+                background-color: #c0c0c0;
+            }
+            QProgressBar {
+                border: 1px solid #cccccc;
+                border-radius: 2px;
+                text-align: center;
+                background-color: white;
+                font-size: 10px;
+            }
+            QProgressBar::chunk {
+                background-color: #3daee9;
+                width: 8px;
+            }
+            QTabWidget::pane {
+                border: 1px solid #cccccc;
+                border-radius: 2px;
+                background-color: white;
+            }
+            QTabBar::tab {
+                background-color: #e0e0e0;
+                border: 1px solid #cccccc;
+                border-bottom: none;
+                border-top-left-radius: 2px;
+                border-top-right-radius: 2px;
+                padding: 2px 6px;
+                margin-right: 1px;
+                font-size: 11px;
+            }
+            QTabBar::tab:selected {
+                background-color: white;
+                border-bottom: 1px solid white;
+            }
+            QTabBar::tab:hover {
+                background-color: #d0d0d0;
+            }
+            QStatusBar {
+                background-color: #e0e0e0;
+                border-top: 1px solid #cccccc;
+            }
+            QSplitter::handle {
+                background-color: #cccccc;
+                width: 1px;
+            }
+            QSplitter::handle:hover {
+                background-color: #aaaaaa;
+            }
+            QToolBar {
+                background-color: #e8e8e8;
+                border-bottom: 1px solid #cccccc;
+                spacing: 2px;
+                padding: 2px;
+            }
+            QToolButton {
+                padding: 2px;
+                border-radius: 2px;
+            }
+            QToolButton:hover {
+                background-color: #d8d8d8;
+            }
+            QToolButton:pressed {
+                background-color: #c8c8c8;
+            }
+            QComboBox {
+                padding: 2px;
+                border: 1px solid #cccccc;
+                border-radius: 2px;
+                background-color: white;
+                font-size: 11px;
+            }
+            QComboBox:hover {
+                background-color: #f8f8f8;
+            }
+            QComboBox::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 13px;
+                border-left: 1px solid #cccccc;
+                border-top-right-radius: 2px;
+                border-bottom-right-radius: 2px;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                width: 0;
+                height: 0;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 6px solid #505050;
+            }
+        """)
+
+    def open_help_url(self):
+        webbrowser.open("https://www.blog.merdekasoft.id")
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("Indo Setup Compression")
+    app.setApplicationVersion("1.0")
+    app.setOrganizationName("IndoLinux")
+    app.setWindowIcon(QIcon.fromTheme("application-x-deb"))
+    window = IndoSetupMainWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
