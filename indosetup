@@ -458,6 +458,23 @@ class BundleInfoDialog(QDialog):
         return self.name_edit.text().strip(), self.version_edit.text().strip()
 
 
+def format_centered_bold_titles(text: str) -> str:
+    """
+    Deteksi blok judul diapit tanda = dan ubah menjadi bold & center (HTML).
+    Contoh blok:
+    =============
+    Judul
+    =============
+    """
+    import re
+    def repl(match):
+        title = match.group(1).strip()
+        return f'<div style="text-align:center;"><b>{title}</b></div>'
+    # regex: blok =...\njudul\n=...\n
+    pattern = re.compile(r'^[= ]{5,}\n(.+?)\n[= ]{5,}$', re.MULTILINE)
+    return pattern.sub(repl, text)
+
+
 class IndoSetupMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1029,8 +1046,13 @@ class IndoSetupMainWindow(QMainWindow):
         dialog.resize(600, 500)
         layout = QVBoxLayout(dialog)
         text_edit = QTextEdit()
-        text_edit.setPlainText(self.readme_editor.toPlainText())
         text_edit.setReadOnly(True)
+        # Format judul khusus
+        raw_text = self.readme_editor.toPlainText()
+        html = format_centered_bold_titles(raw_text)
+        # Ganti newline dengan <br> agar layout tetap mirip
+        html = html.replace("\n", "<br>")
+        text_edit.setHtml(html)
         layout.addWidget(text_edit)
         button_box = QDialogButtonBox(QDialogButtonBox.Ok)
         button_box.accepted.connect(dialog.accept)
@@ -1093,6 +1115,7 @@ class IndoSetupMainWindow(QMainWindow):
     def new_project(self):
         self.selected_repo_pkgs.clear()
         self.selected_manual_debs.clear()
+        self.manual_debs = []  # <-- reset manual_debs ke list kosong
         self.selected_repo_list.clear()
         self.selected_manual_list.clear()
         self.selected_count = 0
