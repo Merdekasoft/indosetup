@@ -1335,7 +1335,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Indo Setup Compression")
     app.setApplicationVersion("1.0")
-    app.setOrganizationName("IndoLinux")
+    app.setDesktopFileName("indosetup")
     app.setWindowIcon(QIcon.fromTheme("application-x-deb"))
     window = IndoSetupMainWindow()
     window.show()
